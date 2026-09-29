@@ -1,59 +1,95 @@
 # @paulorogge/whatsapp-gateway
 
-Modulo TypeScript plugavel para integracao com o **WhatsApp Business Platform**,
-com dois providers intercambiaveis:
+Modulo TypeScript para integracao com o WhatsApp Business Platform, com dois
+providers intercambiaveis:
 
-- **Meta Cloud API** - chamada direta na Graph API da Meta.
-- **Azure Communication Services (Advanced Messaging for WhatsApp)** - chamada via SDK da Azure, que repassa para a Meta por baixo.
+- **Meta Cloud API** (chamada direta na Graph API da Meta)
+- **Azure Communication Services** (Advanced Messaging for WhatsApp), que
+  repassa a chamada para a Meta por baixo
 
-E uma **biblioteca standalone, sem framework HTTP embutido**: voce importa as
-funcoes/classes no seu projeto (Express, Fastify, NestJS, Azure Functions,
-o que for) e pluga nas suas proprias rotas. Nao ha servidor, nao ha
-dependencia de banco de dados - a unica coisa que voce implementa por fora
-e o `TenantStore` (para multi-tenant "de verdade").
+E uma biblioteca standalone, sem framework HTTP embutido: as funcoes e
+classes sao importadas no projeto host (Express, Fastify, NestJS, Azure
+Functions, etc.) e plugadas nas rotas ja existentes. O pacote nao inclui
+servidor nem dependencia de banco de dados; a unica peca implementada por
+fora e o `TenantStore`, para multi-tenant.
 
----
+## Indice
 
-## 1. A duvida Azure x Meta (billing)
-
-**Existe sim** uma forma de nunca colocar cartao de credito direto na Meta:
-o **Azure Communication Services - Advanced Messaging for WhatsApp**.
-Quando voce conecta sua WhatsApp Business Account (WABA) ao recurso da
-Azure, a Azure vira a entidade de cobranca: a fatura da Azure inclui o
-custo repassado da Meta **mais** uma taxa propria da Azure por mensagem
-(US$ 0,005 por mensagem enviada/recebida, segundo a documentacao oficial).
-
-O que isso muda, na pratica, e o que **nao** muda:
-
-| | Meta Cloud API direta | Azure Communication Services |
-|---|---|---|
-| Quem cobra | Meta (cartao no Business Manager) | Azure (fatura unica) |
-| Precisa de WABA verificada na Meta? | Sim | **Sim, tambem** - a Azure conecta numa WABA existente, nao substitui o cadastro |
-| Taxa extra alem do custo Meta | Nao | Sim, taxa de mensagem da propria Azure |
-| API que voce chama | Graph API da Meta | API REST da Azure (`@azure-rest/communication-messages`) |
-| Maturidade/documentacao | Padrao de mercado, mais madura | Mais nova, com menos recursos (ex: sem mensagens interativas na versao estavel atual do SDK Node) |
-
-Ou seja: da para consolidar tudo na fatura da Azure, mas isso nao elimina o
-cadastro na Meta (Business Manager + WABA), so muda quem te cobra pelo uso.
-Por isso este modulo trata os dois como **providers igualmente validos**,
-selecionaveis por variavel de ambiente (`WHATSAPP_DEFAULT_PROVIDER=meta|azure`)
-ou por tenant.
-
-Fontes: [Preco de Mensagens Avancadas - Azure Communication Services](https://learn.microsoft.com/en-us/azure/communication-services/concepts/advanced-messaging/whatsapp/pricing), [Visao geral de Mensagens Avancadas para WhatsApp](https://learn.microsoft.com/en-us/azure/communication-services/concepts/advanced-messaging/whatsapp/whatsapp-overview).
+1. [Instalacao](#1-instalacao)
+2. [Configuracao](#2-configuracao)
+3. [Arquitetura](#3-arquitetura)
+4. [Providers: Meta Cloud API vs Azure Communication Services](#4-providers-meta-cloud-api-vs-azure-communication-services)
+5. [Enviar mensagens](#5-enviar-mensagens)
+6. [Receber mensagens (webhook)](#6-receber-mensagens-webhook)
+7. [Multi-tenant](#7-multi-tenant)
+8. [Limitacoes conhecidas do provider Azure](#8-limitacoes-conhecidas-do-provider-azure)
+9. [Scripts](#9-scripts)
 
 ---
 
-## 2. Arquitetura
+## 1. Instalacao
+
+O pacote e distribuido pelo repositorio git (nao publicado num registry
+publico). Para instalar numa aplicacao:
+
+```bash
+npm install git+https://github.com/paulorogge-gh/WhatsApp-Gateway.git#v0.1.1
+```
+
+A tag (`#v0.1.1`) fixa a versao instalada. Ao atualizar o modulo, publique
+uma tag nova no repositorio e aponte o `npm install` (ou o `package.json` da
+aplicacao consumidora) para ela.
+
+O pacote tem um script `prepare` que roda o build (`tsup`) automaticamente
+apos a instalacao via git, gerando `dist/` dentro de
+`node_modules/@paulorogge/whatsapp-gateway`. Nao e necessario nenhum passo
+manual de build depois do `npm install`.
+
+Alternativas de distribuicao (nao configuradas neste repositorio, mas
+compativeis com a mesma base de codigo):
+
+- **GitHub Packages**: `npm publish` com `publishConfig.registry` apontando
+  para `https://npm.pkg.github.com`, e `.npmrc` correspondente no projeto
+  consumidor.
+- **Azure Artifacts**: feed em Azure DevOps, `publishConfig.registry`
+  apontando para a URL do feed, `npm publish` com um PAT com escopo de
+  packaging.
+
+## 2. Configuracao
+
+Copie `.env.example` para `.env` na aplicacao que for consumir o pacote e
+preencha as variaveis do provider escolhido:
+
+```bash
+cp .env.example .env
+```
+
+| Variavel | Uso |
+|---|---|
+| `WHATSAPP_DEFAULT_PROVIDER` | `meta` ou `azure`. Usado por `createSingleTenantStoreFromEnv()`. |
+| `META_GRAPH_API_VERSION` | Versao da Graph API (padrao `v21.0`). |
+| `META_ACCESS_TOKEN` | Token de acesso (system user) do app na Meta. |
+| `META_PHONE_NUMBER_ID` | ID do numero de telefone no WhatsApp Manager. |
+| `META_APP_SECRET` | App Secret, usado para validar a assinatura HMAC dos webhooks. |
+| `META_WEBHOOK_VERIFY_TOKEN` | Verify token definido na configuracao do webhook no App Dashboard. |
+| `AZURE_ACS_CONNECTION_STRING` | Connection string do recurso Azure Communication Services. |
+| `AZURE_CHANNEL_REGISTRATION_ID` | ID do Channel Registration do canal WhatsApp conectado no ACS. |
+
+Essas variaveis alimentam apenas o tenant `"default"` (via
+`createSingleTenantStoreFromEnv()`). Multi-tenant real usa uma implementacao
+propria de `TenantStore` (secao 7).
+
+## 3. Arquitetura
 
 ```
 src/
   core/
-    types.ts            modelos normalizados (mensagens, status, eventos)
-    IWhatsAppProvider.ts contrato que os providers implementam
-    WhatsAppClient.ts    fachada publica para ENVIO (resolve tenant -> provider)
+    types.ts              modelos normalizados (mensagens, status, eventos)
+    IWhatsAppProvider.ts   contrato que os providers implementam
+    WhatsAppClient.ts      fachada publica para ENVIO (resolve tenant -> provider)
     errors.ts
   providers/
-    createProvider.ts    fabrica: credentials.provider -> instancia do provider certo
+    createProvider.ts      fabrica: credentials.provider -> instancia do provider certo
     meta/
       MetaCloudApiProvider.ts   envio via Graph API
       metaWebhook.ts            assinatura HMAC + parser de payload de RECEBIMENTO
@@ -63,80 +99,42 @@ src/
   tenancy/
     types.ts, TenantStore.ts, InMemoryTenantStore.ts
   webhook/
-    attachTenant.ts       resolve o tenantId de um evento recebido pela routing key
-  index.ts                 tudo que e exportado publicamente
+    attachTenant.ts         resolve o tenantId de um evento recebido pela routing key
+  index.ts                  API publica do pacote
 ```
 
-Principio central: **o resto da sua aplicacao nunca importa `MetaCloudApiProvider`
-ou `AzureAcsProvider` diretamente** para enviar mensagens - ela usa
-`WhatsAppClient`, que escolhe o provider certo a partir das credenciais do
-tenant resolvido. Trocar de provider e trocar dado (credenciais), nunca
-codigo de chamada.
+`WhatsAppClient` e a unica classe que o codigo de aplicacao usa para enviar
+mensagens: ela resolve o tenant, escolhe o provider (`MetaCloudApiProvider`
+ou `AzureAcsProvider`) a partir das credenciais do tenant e delega a
+chamada. O provider por baixo nunca e importado diretamente fora do pacote.
 
-Para RECEBER mensagens, cada provider tem seu proprio parser (os formatos de
-webhook da Meta e do Azure Event Grid sao bem diferentes), mas ambos
-produzem os mesmos tipos normalizados (`InboundEvent`, `InboundMessage`,
-`MessageStatusUpdate`).
+Para recebimento, cada provider expoe seu proprio parser (os formatos de
+webhook da Meta e do Azure Event Grid sao diferentes), mas ambos produzem os
+mesmos tipos normalizados: `InboundEvent`, `InboundMessage`,
+`MessageStatusUpdate`.
 
----
+## 4. Providers: Meta Cloud API vs Azure Communication Services
 
-## 3. Instalacao
+| | Meta Cloud API | Azure Communication Services |
+|---|---|---|
+| Entidade de cobranca | Meta (cartao no Business Manager) | Azure (fatura unica, inclui repasse do custo Meta) |
+| Requer WABA verificada na Meta | Sim | Sim (o recurso Azure se conecta a uma WABA existente) |
+| Taxa adicional | Nao | Sim, taxa de mensagem propria da Azure (US$ 0,005 por mensagem enviada/recebida) |
+| API chamada pelo modulo | Graph API da Meta | API REST da Azure (`@azure-rest/communication-messages`) |
+| Recursos suportados | Conjunto completo (inclui mensagens interativas) | Subconjunto (ver secao 8) |
 
-Este pacote nao esta no npm publico (`private` de proposito). Publique num
-registry privado e instale normalmente:
+Fontes: [Precos de Mensagens Avancadas](https://learn.microsoft.com/en-us/azure/communication-services/concepts/advanced-messaging/whatsapp/pricing), [Visao geral de Mensagens Avancadas para WhatsApp](https://learn.microsoft.com/en-us/azure/communication-services/concepts/advanced-messaging/whatsapp/whatsapp-overview).
 
-### Opcao A - GitHub Packages (mais simples, gratis para repos privados)
+O provider ativo e definido por `credentials.provider` (`"meta"` ou
+`"azure"`) em cada tenant, portanto pode variar por tenant dentro da mesma
+aplicacao. `createSingleTenantStoreFromEnv()` usa `WHATSAPP_DEFAULT_PROVIDER`
+para decidir o provider do tenant `"default"`.
 
-```bash
-# dentro do repositorio do pacote
-npm publish
-```
-
-Com um `.npmrc` no projeto que for consumir:
-
-```
-@paulorogge:registry=https://npm.pkg.github.com
-```
-
-```bash
-npm install @paulorogge/whatsapp-gateway
-```
-
-### Opcao B - Azure Artifacts (faz sentido se voce ja centraliza tudo na Azure)
-
-Crie um feed em Azure DevOps > Artifacts, aponte o `publishConfig.registry`
-do `package.json` para a URL do feed e rode `npm publish` com um token de
-acesso (PAT) com escopo de packaging.
-
-### Opcao C - instalar direto do Git (sem registry)
-
-```bash
-npm install git+https://github.com/<sua-org>/whatsapp-gateway.git#v0.1.0
-```
-
-Qualquer uma das tres formas resolve o objetivo original: **plugar o
-modulo num projeto novo com um `npm install`**, sem copiar pastas.
-
----
-
-## 4. Configuracao
-
-Copie `.env.example` para `.env` e preencha o provider que for usar.
-Para multi-tenant real, essas variaveis viram apenas o "tenant default";
-os demais tenants vem do seu `TenantStore` (banco de dados).
-
-```bash
-cp .env.example .env
-```
-
----
-
-## 5. Uso - enviar mensagens
+## 5. Enviar mensagens
 
 ```ts
 import { WhatsAppClient, InMemoryTenantStore } from "@paulorogge/whatsapp-gateway";
 
-// Single-tenant simples (le do .env) - ou monte o InMemoryTenantStore manualmente:
 const tenantStore = new InMemoryTenantStore([
   {
     id: "cliente-a",
@@ -169,15 +167,18 @@ await whatsapp.sendMedia("cliente-a", {
 });
 ```
 
-Trocar esse mesmo cliente para Azure e so mudar as `credentials` no
-`TenantStore` - nenhuma linha acima muda.
+Trocar o provider de um tenant e uma mudanca nas `credentials` passadas ao
+`TenantStore`; nenhuma chamada a `whatsapp.sendX(...)` muda.
 
----
+`sendText` so e aceito pela WhatsApp Business Platform dentro da janela de
+24h aberta pela ultima mensagem recebida do destinatario. Fora dessa janela,
+o envio precisa ser feito com `sendTemplate`, usando um template aprovado
+previamente no WhatsApp Manager (Meta) ou equivalente.
 
-## 6. Uso - receber mensagens (webhook)
+## 6. Receber mensagens (webhook)
 
-O pacote **nao** cria rotas HTTP; ele expoe funcoes puras para voce plugar
-onde quiser. Exemplo com Express:
+O pacote nao cria rotas HTTP; expoe funcoes puras para serem chamadas dentro
+das rotas da aplicacao host. Exemplo com Express:
 
 ```ts
 import express from "express";
@@ -191,18 +192,18 @@ import {
 
 const app = express();
 
-// Importante: capturar o RAW body para validar a assinatura da Meta.
+// O corpo bruto (raw body) e obrigatorio para validar a assinatura da Meta.
 app.use("/webhooks/meta", express.raw({ type: "application/json" }));
 app.use("/webhooks/azure", express.json());
 
-// --- Meta: handshake de verificacao (uma vez, ao configurar o webhook) ---
+// Meta: handshake de verificacao (GET, configurado uma vez no App Dashboard)
 app.get("/webhooks/meta", (req, res) => {
   const challenge = verifyMetaWebhookSubscription(req.query as Record<string, string>, process.env.META_WEBHOOK_VERIFY_TOKEN!);
   if (challenge) return res.status(200).send(challenge);
   res.sendStatus(403);
 });
 
-// --- Meta: recebimento de mensagens/status ---
+// Meta: recebimento de mensagens e status de entrega
 app.post("/webhooks/meta", async (req, res) => {
   const rawBody = req.body as Buffer;
   const signature = req.header("x-hub-signature-256");
@@ -225,12 +226,11 @@ app.post("/webhooks/meta", async (req, res) => {
   res.sendStatus(200);
 });
 
-// --- Azure: Event Grid (validacao + eventos, no mesmo endpoint) ---
+// Azure: Event Grid (handshake de validacao + eventos, no mesmo endpoint)
 app.post("/webhooks/azure", async (req, res) => {
   const result = parseAzureEventGridPayload(req.body);
 
   if (!Array.isArray(result)) {
-    // handshake de validacao da subscription
     return res.status(200).json({ validationResponse: result.validationResponse });
   }
 
@@ -240,18 +240,17 @@ app.post("/webhooks/azure", async (req, res) => {
 });
 ```
 
-Note que a seguranca dos dois webhooks e diferente por natureza da propria
-plataforma: a Meta assina cada requisicao (HMAC), o Azure Event Grid nao -
-proteja o endpoint `/webhooks/azure` com um segredo na URL e/ou Azure AD,
-conforme a documentacao do Event Grid.
-
----
+A seguranca dos dois webhooks difere por natureza da propria plataforma: a
+Meta assina cada requisicao com HMAC (validado por
+`verifyMetaWebhookSignature`); o Azure Event Grid nao assina, por isso o
+endpoint `/webhooks/azure` deve ser protegido por outro meio (segredo na
+URL, Azure AD), conforme a documentacao do Event Grid.
 
 ## 7. Multi-tenant
 
-`TenantStore` e a unica interface que voce precisa implementar para
-multi-tenant real (varios clientes/projetos, cada um com seu proprio numero
-WhatsApp e, potencialmente, provider diferente):
+`TenantStore` e a interface a implementar para multi-tenant real (varios
+clientes/projetos, cada um com seu proprio numero WhatsApp e,
+potencialmente, provider diferente):
 
 ```ts
 import type { TenantStore, Tenant } from "@paulorogge/whatsapp-gateway";
@@ -268,33 +267,32 @@ export class PostgresTenantStore implements TenantStore {
 }
 ```
 
-`InMemoryTenantStore` (incluso) cobre desenvolvimento, testes e o caso de
-poucos tenants carregados na inicializacao do processo.
-
----
+`InMemoryTenantStore` (incluido no pacote) cobre desenvolvimento, testes e
+o caso de poucos tenants carregados na inicializacao do processo.
+`createSingleTenantStoreFromEnv()` e um atalho que monta um
+`InMemoryTenantStore` com um unico tenant `"default"` a partir das
+variaveis de ambiente descritas na secao 2.
 
 ## 8. Limitacoes conhecidas do provider Azure
 
 A versao estavel atual do SDK Node (`@azure-rest/communication-messages@2.x`)
-tem menos recursos que a Graph API da Meta:
+tem um subconjunto dos recursos da Graph API da Meta:
 
-- **Sem mensagens interativas** (botoes/listas) - `sendInteractiveButtons`
-  lanca `WhatsAppGatewayError` nesse provider. Use o provider Meta para isso.
-- **Sem envio de sticker.**
-- **Sem `caption` em audio** (image/document/video suportam).
+- Sem mensagens interativas (botoes/listas): `sendInteractiveButtons` lanca
+  `WhatsAppGatewayError` nesse provider.
+- Sem envio de sticker.
+- Sem `caption` em mensagens de audio (image/document/video suportam).
 - Templates com variaveis: o modulo converte automaticamente para o formato
-  `values`/`bindings` da Azure, mas so para parametros de texto (cobre a
-  maioria dos casos). Parametros ricos (currency, date_time, midia dentro do
-  template) sao enviados como texto (`fallbackValue`/link).
+  `values`/`bindings` da Azure, mas cobre apenas parametros de texto.
+  Parametros ricos (currency, date_time, midia dentro do template) sao
+  enviados como texto (`fallbackValue`/link).
 
 Nenhuma dessas limitacoes existe no provider Meta.
-
----
 
 ## 9. Scripts
 
 ```bash
-npm install       # instala dependencias
+npm install       # instala dependencias (e roda o build via "prepare")
 npm run typecheck # tsc --noEmit
 npm test          # roda a suite (vitest)
 npm run build     # gera dist/ (esm + cjs + .d.ts) via tsup
